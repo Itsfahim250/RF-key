@@ -20,11 +20,17 @@ How it works
 Everything is stateless / stored in Firebase, so restarts on Render are
 safe and don't lose login sessions or issued keys.
 
+Access keys are single-use: the first Telegram chat that successfully
+enters a key gets locked to it (used_by = chat_id in Firebase). No other
+chat can use that same key afterwards, even before it expires. An admin
+can "release" a key from index.html's Bot Keys tab to unlock it again
+(e.g. if the original user switched devices/accounts).
+
 Firebase layout used (Realtime Database, REST API, no auth required just
 like the existing panel):
-    panel_auth/users/{username}      -> {password, expire_date}   (existing)
-    panel_auth/bot_access/{key}      -> {expire_date}              (new)
-    panel_auth/bot_sessions/{chat_id}-> {key, expire_date}         (new)
+    panel_auth/users/{username}      -> {password, expire_date}          (existing)
+    panel_auth/bot_access/{key}      -> {expire_date, used_by?}           (new)
+    panel_auth/bot_sessions/{chat_id}-> {key, expire_date}                (new)
 
 Environment variables (set these in Render's dashboard):
     BOT_TOKEN        - Telegram bot token from @BotFather (required)
@@ -84,6 +90,13 @@ def fb_set(path, data):
 
 def fb_delete(path):
     r = requests.delete(f"{FIREBASE_DB_URL}/{path}.json", timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def fb_patch(path, data):
+    """Partial update - only touches the given fields, leaves others as-is."""
+    r = requests.patch(f"{FIREBASE_DB_URL}/{path}.json", json=data, timeout=10)
     r.raise_for_status()
     return r.json()
 
@@ -161,13 +174,42 @@ def _parse_date(value):
 
 
 def get_session(chat_id):
-    """Return the session dict if this chat has a valid, un-expired login."""
+    """
+    Return the session dict if this chat has a valid, un-expired login
+    session AND the underlying access key STILL exists, is un-expired,
+    and is still locked to this chat.
+
+    This live-checks Firebase every time (not just the session's own
+    expire_date) so that if the admin deletes or releases the key from
+    index.html, the bot immediately stops honouring the old session
+    instead of trusting a stale local expiry date.
+    """
     data = fb_get(f"panel_auth/bot_sessions/{chat_id}")
     if not data:
         return None
+
     exp_date = _parse_date(data.get("expire_date"))
     if not exp_date or exp_date < datetime.utcnow().date():
+        delete_session(chat_id)
         return None
+
+    key = data.get("key")
+    key_data = fb_get(f"panel_auth/bot_access/{key}") if key else None
+    if not key_data:
+        # Key was deleted by the admin -> session is dead
+        delete_session(chat_id)
+        return None
+
+    key_exp = _parse_date(key_data.get("expire_date"))
+    if not key_exp or key_exp < datetime.utcnow().date():
+        delete_session(chat_id)
+        return None
+
+    if str(key_data.get("used_by", "")) != str(chat_id):
+        # Key was released/reassigned to someone else by the admin
+        delete_session(chat_id)
+        return None
+
     return data
 
 
@@ -179,26 +221,54 @@ def delete_session(chat_id):
     fb_delete(f"panel_auth/bot_sessions/{chat_id}")
 
 
-def validate_access_key(key):
-    """Return the key's expire_date string if valid & not expired, else None."""
+def validate_access_key(key, chat_id):
+    """
+    Single-use keys: the first chat that successfully claims a key gets
+    locked to it (used_by = chat_id). Any other chat trying the same key
+    is rejected, even if the key hasn't expired yet. The same chat can
+    re-enter its own key again later (e.g. after Logout) without issue.
+
+    Returns (expire_date, status) where status is one of:
+        "ok"            - key is valid and now belongs to this chat
+        "not_found"     - key doesn't exist
+        "expired"       - key exists but expire_date has passed
+        "already_used"  - key is locked to a different chat
+    """
     key = (key or "").strip()
     if not key:
-        return None
+        return None, "not_found"
+
     data = fb_get(f"panel_auth/bot_access/{key}")
     if not data:
-        return None
+        return None, "not_found"
+
     exp_date = _parse_date(data.get("expire_date"))
     if not exp_date or exp_date < datetime.utcnow().date():
-        return None
-    return data.get("expire_date")
+        return None, "expired"
+
+    used_by = data.get("used_by")
+    if used_by and str(used_by) != str(chat_id):
+        return None, "already_used"
+
+    if not used_by:
+        fb_patch(f"panel_auth/bot_access/{key}", {"used_by": chat_id})
+
+    return data.get("expire_date"), "ok"
 
 
 # ---- License (username/password) generation -------------------------------
-# Edit these two functions if you want a different username/password format.
+# Edit these if you want a different username/password format.
+# Username template: RF_USER_XXXX  (XXXX = 4 random unambiguous chars)
+
+_KEY_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I - avoids confusion
+
+
+def _rand_segment(length=4):
+    return "".join(random.choice(_KEY_CHARS) for _ in range(length))
+
 
 def gen_username():
-    chars = string.ascii_lowercase + string.digits
-    return "".join(random.choice(chars) for _ in range(8))
+    return f"RF_USER_{_rand_segment(4)}"
 
 
 def gen_password():
@@ -248,16 +318,23 @@ def handle_message(message):
 
     if not session:
         # Not logged in -> treat any text as an attempted access key
-        expire = validate_access_key(text)
-        if expire:
+        expire, status = validate_access_key(text, chat_id)
+        if status == "ok":
             create_session(chat_id, text, expire)
             send_message(
                 chat_id,
                 f"✅ *Access granted!*\nThis session is valid until: `{expire}`",
                 MAIN_MENU_KB,
             )
+        elif status == "already_used":
+            send_message(
+                chat_id,
+                "🚫 This key is already in use on another account.\nAsk the admin to release it or issue you a new one.",
+            )
+        elif status == "expired":
+            send_message(chat_id, "⌛ This key has expired. Please request a new one.")
         else:
-            send_message(chat_id, "❌ Invalid or expired key. Please check and try again.")
+            send_message(chat_id, "❌ Invalid key. Please check and try again.")
         return
 
     # Logged in -> handle menu actions
@@ -286,7 +363,7 @@ def handle_callback(callback):
 
     session = get_session(chat_id)
     if not session:
-        edit_message(chat_id, message_id, "⚠️ Your session has expired. Send /start to log in again.")
+        edit_message(chat_id, message_id, "⚠️ Your access has expired or was revoked. Send /start to log in again.")
         answer_callback(callback_id)
         return
 
