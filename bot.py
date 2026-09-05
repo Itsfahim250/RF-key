@@ -1,43 +1,54 @@
 """
-Telegram License-Generator Bot
---------------------------------
+Telegram Bot - License Generator (DPMods_Security schema)
+------------------------------------------------------------
 Deploy target: Render.com (Web Service, webhook mode).
+
+This matches the NEW admin panel's Firebase schema. Everything lives under
+one root node:
+
+    DPMods_Security/
+        App_Status/              (managed only by index.html - untouched here)
+        Keys/{keyId}              -> {Username, DeviceLimit, ExpiryDate,
+                                       ExpiresAt, Devices, Banned}
+        Bot_Access/{key}          -> {ExpiryDate, UsedBy}
+                                      (generated from index.html's "Bot Access" tab)
+        Bot_Sessions/{chat_id}    -> {Key, ExpiryDate, Pending?}
+                                      (bot-internal only, not shown in the panel)
 
 How it works
 ============
-1. An admin generates a "Bot Access Key" from index.html (Bot Keys tab).
-2. The admin sends /start to the Telegram bot, then pastes that access key.
-3. If the key is valid and not expired, the bot creates a login session for
-   that chat and shows a menu: "Generate License Key" and "Logout".
-4. Tapping "Generate License Key" shows duration buttons (1 Day / 3 Days /
-   7 Days / 1 Month). Whichever is tapped, the bot creates a new
-   username + password + expire_date entry in the SAME Firebase node that
-   index.html's "Users" tab reads from (panel_auth/users), and shows the
-   result in a copyable, monospace format.
-5. "Logout" clears the chat's session; a new access key is required to use
-   the bot again.
+1. Admin generates a "Bot Access Key" from index.html's Bot Access tab
+   (format: RF_XXXX_XXXX_XXXX, unchanged from before).
+2. In Telegram, send /start to the bot, then paste that key to activate.
+3. Once activated, tap "🔑 Generate License Key":
+      a) Pick a duration: 1/2/3 Hours, 1/3/7/10/15 Days, or 1 Month.
+      b) Bot asks how many devices the license should support - reply
+         with a number (e.g. 1, 2, 5).
+      c) Bot creates a new key in DPMods_Security/Keys using the SAME
+         template the admin panel itself uses (DP-VIP-XXXXXX) and sends
+         it back in a copyable format.
+4. "🚪 Logout" ends the session; a valid access key is required again.
 
-Everything is stateless / stored in Firebase, so restarts on Render are
-safe and don't lose login sessions or issued keys.
+Access keys are single-use (locked to the first chat that claims them) and
+are live-checked on every action, so deleting/releasing a key from the
+admin panel immediately revokes bot access.
 
-Access keys are single-use: the first Telegram chat that successfully
-enters a key gets locked to it (used_by = chat_id in Firebase). No other
-chat can use that same key afterwards, even before it expires. An admin
-can "release" a key from index.html's Bot Keys tab to unlock it again
-(e.g. if the original user switched devices/accounts).
-
-Firebase layout used (Realtime Database, REST API, no auth required just
-like the existing panel):
-    panel_auth/users/{username}      -> {password, expire_date}          (existing)
-    panel_auth/bot_access/{key}      -> {expire_date, used_by?}           (new)
-    panel_auth/bot_sessions/{chat_id}-> {key, expire_date}                (new)
+A NOTE ON HOUR-LEVEL DURATIONS: DPMods_Security/Keys stores ExpiryDate as
+a plain YYYY-MM-DD date - that's the existing admin-panel template and it
+was left unchanged, as requested. That means 1/2/3-hour keys are also
+stored with today's date, so the admin panel itself (and anything that
+only checks ExpiryDate) will treat them as valid until end of day. This
+bot additionally writes an `ExpiresAt` field (full UTC timestamp) on every
+key it creates, so anything that wants true hour-level precision (your
+app's own validation logic) can check that field instead.
 
 Environment variables (set these in Render's dashboard):
     BOT_TOKEN        - Telegram bot token from @BotFather (required)
-    WEBHOOK_SECRET   - any random string you choose, used as part of the
-                        webhook URL path so randoms can't hit your webhook
-                        (required)
-    FIREBASE_DB_URL  - optional, defaults to the same DB index.html uses
+    WEBHOOK_SECRET   - random string of your choosing, used in the webhook
+                        URL path (required)
+    FIREBASE_DB_URL  - the SAME Firebase Realtime DB URL you type into the
+                        admin panel's login screen (required - the panel
+                        no longer hardcodes one, so this must be set)
 """
 
 import os
@@ -54,19 +65,22 @@ from flask import Flask, request, jsonify
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me")
-FIREBASE_DB_URL = os.environ.get(
-    "FIREBASE_DB_URL",
-    "https://device-fccef-default-rtdb.firebaseio.com",
-).rstrip("/")
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "").rstrip("/")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+ROOT = "DPMods_Security"
 
-# code -> (button label, number of days)
+# code -> (button label, timedelta)
 DURATIONS = {
-    "1d": ("1 Day", 1),
-    "3d": ("3 Days", 3),
-    "7d": ("7 Days", 7),
-    "1m": ("1 Month", 30),
+    "1h": ("1 Hour", timedelta(hours=1)),
+    "2h": ("2 Hours", timedelta(hours=2)),
+    "3h": ("3 Hours", timedelta(hours=3)),
+    "1d": ("1 Day", timedelta(days=1)),
+    "3d": ("3 Days", timedelta(days=3)),
+    "7d": ("7 Days", timedelta(days=7)),
+    "10d": ("10 Days", timedelta(days=10)),
+    "15d": ("15 Days", timedelta(days=15)),
+    "1m": ("1 Month", timedelta(days=30)),
 }
 
 app = Flask(__name__)
@@ -154,16 +168,16 @@ REMOVE_KB = {"remove_keyboard": True}
 
 def duration_inline_kb():
     buttons = [
-        {"text": label, "callback_data": f"gen:{code}"}
-        for code, (label, _days) in DURATIONS.items()
+        {"text": label, "callback_data": f"dur:{code}"}
+        for code, (label, _delta) in DURATIONS.items()
     ]
-    # 2 buttons per row
-    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    # 3 buttons per row
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
     return {"inline_keyboard": rows}
 
 
 # --------------------------------------------------------------------------
-# Business logic
+# Session / access-key logic  (Bot_Access + Bot_Sessions)
 # --------------------------------------------------------------------------
 
 def _parse_date(value):
@@ -175,37 +189,36 @@ def _parse_date(value):
 
 def get_session(chat_id):
     """
-    Return the session dict if this chat has a valid, un-expired login
-    session AND the underlying access key STILL exists, is un-expired,
-    and is still locked to this chat.
+    Return the session dict if this chat is validly activated AND the
+    underlying access key it used still exists, is un-expired, and is
+    still locked to this chat.
 
     This live-checks Firebase every time (not just the session's own
-    expire_date) so that if the admin deletes or releases the key from
-    index.html, the bot immediately stops honouring the old session
-    instead of trusting a stale local expiry date.
+    ExpiryDate) so that if the admin deletes or releases the key from
+    index.html, the bot immediately stops honouring the old session.
     """
-    data = fb_get(f"panel_auth/bot_sessions/{chat_id}")
+    data = fb_get(f"{ROOT}/Bot_Sessions/{chat_id}")
     if not data:
         return None
 
-    exp_date = _parse_date(data.get("expire_date"))
+    exp_date = _parse_date(data.get("ExpiryDate"))
     if not exp_date or exp_date < datetime.utcnow().date():
         delete_session(chat_id)
         return None
 
-    key = data.get("key")
-    key_data = fb_get(f"panel_auth/bot_access/{key}") if key else None
+    key = data.get("Key")
+    key_data = fb_get(f"{ROOT}/Bot_Access/{key}") if key else None
     if not key_data:
         # Key was deleted by the admin -> session is dead
         delete_session(chat_id)
         return None
 
-    key_exp = _parse_date(key_data.get("expire_date"))
+    key_exp = _parse_date(key_data.get("ExpiryDate"))
     if not key_exp or key_exp < datetime.utcnow().date():
         delete_session(chat_id)
         return None
 
-    if str(key_data.get("used_by", "")) != str(chat_id):
+    if str(key_data.get("UsedBy", "")) != str(chat_id):
         # Key was released/reassigned to someone else by the admin
         delete_session(chat_id)
         return None
@@ -214,80 +227,93 @@ def get_session(chat_id):
 
 
 def create_session(chat_id, key, expire_date):
-    fb_set(f"panel_auth/bot_sessions/{chat_id}", {"key": key, "expire_date": expire_date})
+    fb_set(f"{ROOT}/Bot_Sessions/{chat_id}", {"Key": key, "ExpiryDate": expire_date})
 
 
 def delete_session(chat_id):
-    fb_delete(f"panel_auth/bot_sessions/{chat_id}")
+    fb_delete(f"{ROOT}/Bot_Sessions/{chat_id}")
+
+
+def set_pending(chat_id, pending):
+    fb_patch(f"{ROOT}/Bot_Sessions/{chat_id}", {"Pending": pending})
+
+
+def clear_pending(chat_id):
+    fb_delete(f"{ROOT}/Bot_Sessions/{chat_id}/Pending")
 
 
 def validate_access_key(key, chat_id):
     """
     Single-use keys: the first chat that successfully claims a key gets
-    locked to it (used_by = chat_id). Any other chat trying the same key
-    is rejected, even if the key hasn't expired yet. The same chat can
-    re-enter its own key again later (e.g. after Logout) without issue.
+    locked to it (UsedBy = chat_id). Any other chat trying the same key
+    is rejected, even if the key hasn't expired yet.
 
     Returns (expire_date, status) where status is one of:
         "ok"            - key is valid and now belongs to this chat
         "not_found"     - key doesn't exist
-        "expired"       - key exists but expire_date has passed
+        "expired"       - key exists but ExpiryDate has passed
         "already_used"  - key is locked to a different chat
     """
     key = (key or "").strip()
     if not key:
         return None, "not_found"
 
-    data = fb_get(f"panel_auth/bot_access/{key}")
+    data = fb_get(f"{ROOT}/Bot_Access/{key}")
     if not data:
         return None, "not_found"
 
-    exp_date = _parse_date(data.get("expire_date"))
+    exp_date = _parse_date(data.get("ExpiryDate"))
     if not exp_date or exp_date < datetime.utcnow().date():
         return None, "expired"
 
-    used_by = data.get("used_by")
+    used_by = data.get("UsedBy")
     if used_by and str(used_by) != str(chat_id):
         return None, "already_used"
 
     if not used_by:
-        fb_patch(f"panel_auth/bot_access/{key}", {"used_by": chat_id})
+        fb_patch(f"{ROOT}/Bot_Access/{key}", {"UsedBy": chat_id})
 
-    return data.get("expire_date"), "ok"
-
-
-# ---- License (username/password) generation -------------------------------
-# Edit these if you want a different username/password format.
-# Username template: RF_USER_XXXX  (XXXX = 4 random unambiguous chars)
-
-_KEY_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I - avoids confusion
+    return data.get("ExpiryDate"), "ok"
 
 
-def _rand_segment(length=4):
-    return "".join(random.choice(_KEY_CHARS) for _ in range(length))
+# --------------------------------------------------------------------------
+# License key generation (DPMods_Security/Keys)
+# Template is UNCHANGED from the admin panel: DP-VIP-XXXXXX
+# --------------------------------------------------------------------------
+
+_BASE36 = string.digits + string.ascii_lowercase
 
 
-def gen_username():
-    return f"RF_USER_{_rand_segment(4)}"
+def gen_license_key():
+    rand = "".join(random.choice(_BASE36) for _ in range(6)).upper()
+    return f"DP-VIP-{rand}"
 
 
-def gen_password():
-    chars = string.ascii_letters + string.digits
-    return "".join(random.choice(chars) for _ in range(8))
+def create_license(chat_id, from_user, duration_code, device_limit):
+    label, delta = DURATIONS[duration_code]
+    expires_at = datetime.utcnow() + delta
 
-
-def create_license(days):
-    username = gen_username()
-    # avoid extremely unlikely collisions
-    for _ in range(5):
-        if not fb_get(f"panel_auth/users/{username}"):
+    key_id = gen_license_key()
+    for _ in range(5):  # avoid extremely unlikely collisions
+        if not fb_get(f"{ROOT}/Keys/{key_id}"):
             break
-        username = gen_username()
+        key_id = gen_license_key()
 
-    password = gen_password()
-    expire_date = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
-    fb_set(f"panel_auth/users/{username}", {"password": password, "expire_date": expire_date})
-    return username, password, expire_date
+    username = None
+    if from_user:
+        tg_username = from_user.get("username")
+        username = f"@{tg_username}" if tg_username else (from_user.get("first_name") or f"tg_{chat_id}")
+
+    payload = {
+        "Username": username,
+        "DeviceLimit": device_limit,
+        "ExpiryDate": expires_at.strftime("%Y-%m-%d"),
+        "ExpiresAt": expires_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "Devices": {"dummy": 0},
+        "Banned": False,
+    }
+    fb_set(f"{ROOT}/Keys/{key_id}", payload)
+    return key_id, label, expires_at
 
 
 # --------------------------------------------------------------------------
@@ -303,13 +329,13 @@ def handle_message(message):
         if session:
             send_message(
                 chat_id,
-                "✅ *Welcome back!* You're already logged in.\nUse the menu below.",
+                "✅ *Welcome back!* You're already activated.\nUse the menu below.",
                 MAIN_MENU_KB,
             )
         else:
             send_message(
                 chat_id,
-                "🔐 Please enter your *Access Key* to unlock this bot:",
+                "🔐 Please enter your *Access Key* to activate this bot:",
                 REMOVE_KB,
             )
         return
@@ -317,13 +343,13 @@ def handle_message(message):
     session = get_session(chat_id)
 
     if not session:
-        # Not logged in -> treat any text as an attempted access key
+        # Not activated -> treat any text as an attempted access key
         expire, status = validate_access_key(text, chat_id)
         if status == "ok":
             create_session(chat_id, text, expire)
             send_message(
                 chat_id,
-                f"✅ *Access granted!*\nThis session is valid until: `{expire}`",
+                f"✅ *Activated!*\nThis session is valid until: `{expire}`",
                 MAIN_MENU_KB,
             )
         elif status == "already_used":
@@ -337,14 +363,42 @@ def handle_message(message):
             send_message(chat_id, "❌ Invalid key. Please check and try again.")
         return
 
-    # Logged in -> handle menu actions
+    # Activated -> are we waiting for a device-count reply?
+    pending = session.get("Pending") or {}
+    if pending.get("Type") == "awaiting_devices":
+        if not text.isdigit() or int(text) < 1:
+            send_message(chat_id, "⚠️ Please send a valid number of devices (e.g. 1, 2, 5).")
+            return
+
+        device_limit = min(int(text), 100)
+        duration_code = pending.get("DurationCode")
+        if duration_code not in DURATIONS:
+            clear_pending(chat_id)
+            send_message(chat_id, "⚠️ Something went wrong - please tap 'Generate License Key' again.", MAIN_MENU_KB)
+            return
+
+        key_id, label, expires_at = create_license(chat_id, message.get("from"), duration_code, device_limit)
+        clear_pending(chat_id)
+
+        reply = (
+            "✅ *License Created!*\n\n"
+            f"🔑 Key: `{key_id}`\n"
+            f"⏳ Duration: {label}\n"
+            f"📅 Expires: `{expires_at.strftime('%Y-%m-%d %H:%M UTC')}`\n"
+            f"📱 Devices: `{device_limit}`\n\n"
+            "_Tap the key above to copy it._"
+        )
+        send_message(chat_id, reply, MAIN_MENU_KB)
+        return
+
+    # Activated, no pending action -> handle menu buttons
     if text == "🔑 Generate License Key":
         send_message(chat_id, "📅 *Select duration for the new license:*", duration_inline_kb())
     elif text == "🚪 Logout":
         delete_session(chat_id)
         send_message(
             chat_id,
-            "👋 You've been logged out.\nSend /start and enter an access key to log in again.",
+            "👋 You've been logged out.\nSend /start and enter an access key to activate again.",
             REMOVE_KB,
         )
     else:
@@ -357,33 +411,30 @@ def handle_callback(callback):
     data = callback.get("data", "")
     callback_id = callback["id"]
 
-    if not data.startswith("gen:"):
+    if not data.startswith("dur:"):
         answer_callback(callback_id)
         return
 
     session = get_session(chat_id)
     if not session:
-        edit_message(chat_id, message_id, "⚠️ Your access has expired or was revoked. Send /start to log in again.")
+        edit_message(chat_id, message_id, "⚠️ Your access has expired or was revoked. Send /start to activate again.")
         answer_callback(callback_id)
         return
 
     code = data.split(":", 1)[1]
-    label, days = DURATIONS.get(code, (None, None))
-    if days is None:
+    if code not in DURATIONS:
         answer_callback(callback_id, "Unknown option.")
         return
 
-    username, password, expire_date = create_license(days)
+    set_pending(chat_id, {"Type": "awaiting_devices", "DurationCode": code})
 
-    text = (
-        "✅ *License Created!*\n\n"
-        f"👤 Username: `{username}`\n"
-        f"🔑 Password: `{password}`\n"
-        f"📅 Expires: `{expire_date}` ({label})\n\n"
-        "_Tap any value above to copy it._"
+    label = DURATIONS[code][0]
+    edit_message(
+        chat_id,
+        message_id,
+        f"⏳ Duration set to *{label}*.\n\n📱 How many devices should this license support?\nReply with a number (e.g. 1, 2, 5):",
     )
-    edit_message(chat_id, message_id, text)
-    answer_callback(callback_id, "License created ✅")
+    answer_callback(callback_id, f"{label} selected")
 
 
 # --------------------------------------------------------------------------
